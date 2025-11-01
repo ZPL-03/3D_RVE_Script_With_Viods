@@ -16,7 +16,7 @@ This repository contains ABAQUS Python scripts for automatically generating 3D R
 - **Minimum Distance Control**: Ensures minimum spacing between:
   - Fiber-to-fiber (2D periodic)
   - Void-to-void (3D periodic)
-  - Fiber-to-void (3D)
+  - Fiber-to-void (2D)
 - **Automatic Modeling**:
   - Material property assignment
   - Section definition
@@ -220,7 +220,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **最小间距控制**：确保以下间距：
   - 纤维-纤维（2D周期性）
   - 空隙-空隙（3D周期性）
-  - 纤维-空隙（3D）
+  - 纤维-空隙（2D）
 - **自动化建模**：
   - 材料属性赋值
   - 截面定义
