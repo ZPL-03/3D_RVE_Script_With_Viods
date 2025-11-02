@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 # ##################################################################
 #
-#   可控制纤维体积分数和多空隙缺陷(圆柱体)的Abaqus三维RVE建模脚本
+#   可控制纤维体积分数和多空隙缺陷的Abaqus三维RVE建模脚本
 #
 # 功能说明:
 # 1. 根据设定的纤维体积分数(Vf)和空隙率(Vp)自动生成三维RVE几何模型
-# 2. 算法流程: [纤维优先，空隙后置]
+# 2. 算法流程:
 #    a. [纤维优先] 采用RSA播种 + 锚定松弛算法排布纤维, 保证纤维间(F-F)间距 (2D)
-#    b. [空隙后置] 采用3D RSA算法排布圆柱体空隙, 播种时同时检查:
-#       i.  空隙-空隙 (V-V) 间距 (3D 轴线-轴线 27盒子检测)
-#       ii. 空隙-纤维 (F-V) 间距 (2D 中心-中心 9盒子(XY)检测, 采用保守包围球半径)
+#    b. [空隙后置] 采用3D RSA算法排布空隙, 播种时同时检查:
+#       i.  空隙-空隙 (V-V) 间距 (3D 中心-中心 27盒子检测)
+#       ii. 空隙-纤维 (F-V) 间距 (2D 中心-中心 9盒子(XY)检测)
 # 3. 自动创建材料、赋予截面、划分网格
 # 4. 施加三维周期性边界条件(PBCs) - [通过ABAQUS Micromechanics Plugin]
 # 5. 在纤维-基体界面插入三维cohesive单元(COH3D8/COH3D6)
@@ -21,7 +21,7 @@
 #     Composite Structures, 360, 119040.
 #
 # 作者: 刘正鹏 (Liu Zhengpeng)
-# 版本: v1.0
+# 版本: v1.1 (MP-PBC + 优化的排布逻辑)
 # 创建日期: 2025-09-30
 # 适用软件: ABAQUS 2023 (需安装 Micromechanics Plugin)
 # Python版本: 2.7 (ABAQUS内置)
@@ -56,145 +56,62 @@ executeOnCaeStartup()
 
 
 # =================================================================
-#                 3D 空间直线/间距检测
-# =================================================================
-
-def shortest_distance_between_segments(p1, q1, p2, q2):
-    """计算空间中两条线段 p1-q1 和 p2-q2 之间的最短距离 (解析法)"""
-    # 向量表示
-    u = (q1[0] - p1[0], q1[1] - p1[1], q1[2] - p1[2])
-    v = (q2[0] - p2[0], q2[1] - p2[1], q2[2] - p2[2])
-    w = (p1[0] - p2[0], p1[1] - p2[1], p1[2] - p2[2])
-
-    # 点积
-    a = u[0] * u[0] + u[1] * u[1] + u[2] * u[2]  # dot(u, u)
-    b = u[0] * v[0] + u[1] * v[1] + u[2] * v[2]  # dot(u, v)
-    c = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]  # dot(v, v)
-    d = u[0] * w[0] + u[1] * w[1] + u[2] * w[2]  # dot(u, w)
-    e = v[0] * w[0] + v[1] * w[1] + v[2] * w[2]  # dot(v, w)
-
-    D = a * c - b * b
-    sD, tD = D, D
-
-    if D < 1e-7:  # 平行线
-        sN = 0.0
-        sD = 1.0
-        tN = e
-        tD = c
-    else:
-        sN = (b * e - c * d)
-        tN = (a * e - b * d)
-        if sN < 0.0:
-            sN = 0.0
-            tN = e
-            tD = c
-        elif sN > sD:
-            sN = sD
-            tN = e + b
-            tD = c
-
-    if tN < 0.0:
-        tN = 0.0
-        if -d < 0.0:
-            sN = 0.0
-        elif -d > a:
-            sN = a
-        else:
-            sN = -d
-        sD = a
-    elif tN > tD:
-        tN = tD
-        if (-d + b) < 0.0:
-            sN = 0.0
-        elif (-d + b) > a:
-            sN = a
-        else:
-            sN = -d + b
-        sD = a
-
-    sc = 0.0 if abs(sN) < 1e-7 else sN / sD
-    tc = 0.0 if abs(tN) < 1e-7 else tN / tD
-
-    # 计算距离向量
-    dP_x = w[0] + (sc * u[0]) - (tc * v[0])
-    dP_y = w[1] + (sc * u[1]) - (tc * v[1])
-    dP_z = w[2] + (sc * u[2]) - (tc * v[2])
-
-    return math.sqrt(dP_x ** 2 + dP_y ** 2 + dP_z ** 2)
-
-
-def _get_cylinder_endpoints(cx, cy, cz, rot_z, rot_x, void_length):
-    """根据圆柱体中心和方向计算其轴线端点"""
-    L_half = void_length / 2.0
-    cos_rz = math.cos(rot_z)
-    sin_rz = math.sin(rot_z)
-    cos_rx = math.cos(rot_x)
-    sin_rx = math.sin(rot_x)
-    # 起点 (local y = -L/2)
-    p1_x = L_half * sin_rz
-    p1_y = -L_half * cos_rz
-    p2_x = p1_x
-    p2_y = p1_y * cos_rx
-    p2_z = p1_y * sin_rx
-    p_void = (cx + p2_x, cy + p2_y, cz + p2_z)
-    # 终点 (local y = +L/2)
-    q1_x = -L_half * sin_rz
-    q1_y = L_half * cos_rz
-    q2_x = q1_x
-    q2_y = q1_y * cos_rx
-    q2_z = q1_y * sin_rx
-    q_void = (cx + q2_x, cy + q2_y, cz + q2_z)
-    return p_void, q_void
-
-
-# =================================================================
 #                 3D RSA 算法 (用于空隙排布)
 # =================================================================
 
-def _generate_void_coordinates_rsa(num_voids, rveSize, void_length,
-                                   min_void_dist_axis,
-                                   fiber_centers, min_fiber_void_dist_2D,
+def _get_3d_periodic_distance_sq(p1, p2, rveSize):
+    """计算三维周期性空间中两个点之间的最短距离的平方"""
+    dx = abs(p1[0] - p2[0])
+    dy = abs(p1[1] - p2[1])
+    dz = abs(p1[2] - p2[2])
+
+    if dx > rveSize[0] / 2.0:
+        dx = rveSize[0] - dx
+    if dy > rveSize[1] / 2.0:
+        dy = rveSize[1] - dy
+    if dz > rveSize[2] / 2.0:
+        dz = rveSize[2] - dz
+
+    return dx * dx + dy * dy + dz * dz
+
+
+def _generate_void_coordinates_rsa(num_voids, rveSize, min_void_dist_3D_VV,
+                                   fiber_centers, min_fiber_void_dist_2D_FV,
                                    max_attempts=5000):
     """
     使用3D RSA(随机顺序吸附)算法生成空隙
-    V-V 检查: 3D 轴线-轴线 27盒子干涉检测
-    F-V 检查: 2D 中心-中心 9盒子(XY)干涉检测 (使用保守包围半径)
+    V-V 检查: 3D 中心-中心 27盒子干涉检测
+    F-V 检查: 2D 中心-中心 9盒子(XY)干涉检测
 
     参数:
         num_voids: 目标空隙数量
         rveSize: RVE尺寸 [L, W, H]
-        void_length: 圆柱体空隙的长度 (仅用于V-V检测)
-        min_void_dist_axis: 空隙轴线间的最小允许距离 (3D, V-V)
+        min_void_dist_3D_VV: 空隙中心点的最小允许距离 (3D, V-V)
         fiber_centers: 已固定的纤维中心 [(x, y), ...]
-        min_fiber_void_dist_2D: 纤维-空隙最小中心距离 (2D保守, F-V)
+        min_fiber_void_dist_2D_FV: 纤维-空隙最小中心距离 (2D, F-V)
         max_attempts: 每次放置尝试的最大次数
 
     返回:
-        void_list: [(cx, cy, cz, rot_z, rot_x), ...]
+        void_list: [(cx, cy, cz, 0.0, 0.0), ...] (球体不需要旋转)
     """
-    print("--- Initializing 3D RSA for void placement (V-V Axis-to-Axis & F-V 2D-Conservative Center) ---")
+    print("--- Initializing 3D RSA for void placement (V-V 3D-Center & F-V 2D-Center) ---")
     print("    Target voids: %d" % num_voids)
-    print("    Min V-V Axis-to-Axis distance (3D): %.6f" % min_void_dist_axis)
-    print("    Min F-V Center-to-Center distance (2D Conservative): %.6f" % min_fiber_void_dist_2D)
+    print("    Min V-V center distance (3D): %.6f" % min_void_dist_3D_VV)
+    print("    Min F-V center distance (2D): %.6f" % min_fiber_void_dist_2D_FV)
 
     void_list = []
     L, W, H = rveSize[0], rveSize[1], rveSize[2]
 
-    # 定义 27 (V-V) 周期性偏移
-    offsets_3d = []
-    for dx in [-L, 0, L]:
-        for dy in [-W, 0, W]:
-            for dz in [-H, 0, H]:
-                offsets_3d.append((dx, dy, dz))
+    # V-V 检查
+    min_dist_sq_VV = min_void_dist_3D_VV ** 2
+    existing_void_centers = []  # 用于 V-V 检查
 
-    # 定义 9 (F-V) 周期性偏移
+    # F-V 检查
+    min_dist_sq_FV = min_fiber_void_dist_2D_FV ** 2
     offsets_2d_xy = []
     for dx in [-L, 0, L]:
         for dy in [-W, 0, W]:
             offsets_2d_xy.append((dx, dy))
-
-    # F-V 检查使用距离的平方
-    min_fv_dist_sq = min_fiber_void_dist_2D ** 2
 
     for i in range(num_voids):
         placed = False
@@ -203,68 +120,44 @@ def _generate_void_coordinates_rsa(num_voids, rveSize, void_length,
             cx_new = rd.uniform(0, L)
             cy_new = rd.uniform(0, W)
             cz_new = rd.uniform(0, H)
-            rot_z_new = rd.uniform(0, 2 * math.pi)
-            rot_x_new = rd.uniform(0, 2 * math.pi)
+            center_new = (cx_new, cy_new, cz_new)
 
             is_too_close = False
 
-            # 2. V-V 检查 (Axis-to-Axis, 27-box)
-            # 仅当存在已放置空隙时才需要计算新空隙的3D端点
-            if void_list:
-                p_new, q_new = _get_cylinder_endpoints(
-                    cx_new, cy_new, cz_new, rot_z_new, rot_x_new, void_length
-                )
-
-                for void_data_existing in void_list:
-                    (cx_ex, cy_ex, cz_ex, rot_z_ex, rot_x_ex) = void_data_existing
-
-                    # 获取已存在空隙的轴线端点
-                    p_existing, q_existing = _get_cylinder_endpoints(
-                        cx_ex, cy_ex, cz_ex, rot_z_ex, rot_x_ex, void_length
-                    )
-
-                    # 检查新空隙(p_new, q_new)与已存在空隙的27个镜像(p_mir, q_mir)的距离
-                    for dx, dy, dz in offsets_3d:
-                        p_mir = (p_existing[0] + dx, p_existing[1] + dy, p_existing[2] + dz)
-                        q_mir = (q_existing[0] + dx, q_existing[1] + dy, q_existing[2] + dz)
-
-                        dist = shortest_distance_between_segments(p_new, q_new, p_mir, q_mir)
-
-                        if dist < min_void_dist_axis:
-                            is_too_close = True
-                            break
-
-                    if is_too_close:
-                        break
-
+            # 2. V-V 检查 (3D Center-to-Center)
+            for center_existing in existing_void_centers:
+                dist_sq = _get_3d_periodic_distance_sq(center_new, center_existing, rveSize)
+                if dist_sq < min_dist_sq_VV:
+                    is_too_close = True
+                    break
             if is_too_close:
-                continue  # 尝试新的 attempt
+                continue
 
-            # 3. F-V 检查 (Conservative 2D Center-to-Center, 9-box XY)
-            # 此检查不关心3D朝向, 只关心(cx, cy)
+            # 3. F-V 检查 (2D Center-to-Center, 9-box XY)
             for fx, fy in fiber_centers:
                 # 检查新空隙(cx_new, cy_new)与纤维的9个XY平面镜像(fx_mir, fy_mir)的距离
                 for dx, dy in offsets_2d_xy:
                     fx_mir = fx + dx
                     fy_mir = fy + dy
 
-                    dist_sq = (cx_new - fx_mir) ** 2 + (cy_new - fy_mir) ** 2
+                    # 2D distance check
+                    dist_sq_2d = (cx_new - fx_mir) ** 2 + (cy_new - fy_mir) ** 2
 
-                    if dist_sq < min_fv_dist_sq:
+                    if dist_sq_2d < min_dist_sq_FV:
                         is_too_close = True
                         break  # (offsets_2d_xy loop)
-
                 if is_too_close:
                     break  # (fiber_centers loop)
-
             if is_too_close:
                 continue  # 尝试新的 attempt
 
             # 4. 放置
             if not is_too_close:
-                void_list.append((cx_new, cy_new, cz_new, rot_z_new, rot_x_new))
+                existing_void_centers.append(center_new)
+                # 球体不需要旋转
+                void_list.append((cx_new, cy_new, cz_new, 0.0, 0.0))
                 placed = True
-                break  # (attempt loop)
+                break
 
         if not placed:
             print("    WARNING: RSA void placement congested. Placed %d of %d voids." % (len(void_list), num_voids))
@@ -485,39 +378,35 @@ def _generate_fiber_layout(fiberCount, rveSize, minFiberDistance, rsa_seeding_ra
 #                 CSV坐标输出模块
 # =================================================================
 
-def exportVoidGeometryToCSV(filename, void_list, void_dims, rveVolume, target_porosity):
+def exportVoidGeometryToCSV(filename, void_list, void_radius, rveVolume, target_porosity):
     """将多个空隙的几何信息导出为CSV文件"""
     try:
         work_dir = os.getcwd()
         filepath = os.path.join(work_dir, filename)
 
         num_voids = len(void_list)
-        # void_dims 是 [Length, Radius]
-        # 体积是 pi * R^2 * L
-        void_length = void_dims[0]
-        void_radius = void_dims[1]
-        vol_per_void = math.pi * (void_radius ** 2) * void_length
+        # 体积是 4/3 * pi * R^3
+        vol_per_void = (4.0 / 3.0) * math.pi * (void_radius ** 3)
         actual_volume = num_voids * vol_per_void
         actual_porosity = actual_volume / rveVolume
 
         with open(filepath, 'w') as f:
             f.write("# 3D RVE Multi-Void Geometry Information\n")
             f.write("# Generated: %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
-            f.write("# Void Type: Cylinder\n")
+            f.write("# Void Type: Sphere\n")
             f.write("# Target Porosity: %.4f%%\n" % (target_porosity * 100))
             f.write("# RVE Volume: %.8f\n" % rveVolume)
             f.write("# --- Per Void --- \n")
-            f.write("# Dimensions (Length, Radius): %.6f, %.6f\n" % (
-                void_length, void_radius))
+            f.write("# Radius: %.6f\n" % (void_radius))
             f.write("# Volume per Void: %.8f\n" % vol_per_void)
             f.write("# --- Total --- \n")
             f.write("# Void Count (Placed): %d\n" % num_voids)
             f.write("# Total Void Volume (Actual): %.8f\n" % actual_volume)
             f.write("# Actual Porosity: %.4f%%\n" % (actual_porosity * 100))
             f.write("#\n")
-            f.write("Void_ID,Center_X,Center_Y,Center_Z,Rotation_Z(rad),Rotation_X(rad)\n")
-            for i, (cx, cy, cz, rot_z, rot_x) in enumerate(void_list, start=1):
-                f.write("%d,%.8f,%.8f,%.8f,%.8f,%.8f\n" % (i, cx, cy, cz, rot_z, rot_x))
+            f.write("Void_ID,Center_X,Center_Y,Center_Z,Radius\n")
+            for i, (cx, cy, cz, _, _) in enumerate(void_list, start=1):
+                f.write("%d,%.8f,%.8f,%.8f,%.8f\n" % (i, cx, cy, cz, void_radius))
 
         print("\n" + "=" * 60)
         print("SUCCESS: Void geometry exported to CSV")
@@ -638,7 +527,7 @@ def verifyMinimumFiberDistance3D(fiber_centers, rveSize, fiberRadius, minFiberDi
 # =================================================================
 
 def buildAllPeriodicCenters3D(centers, rveSize, radius):
-    """构建包含周期性镜像的完整纤维中心列表 (XY平面)"""
+    """构建包含周期性镜像的完整组分中心列表 (XY平面)"""
     all_centers = []
     rveW, rveH = rveSize[0], rveSize[1]
     for xt, yt in centers:
@@ -647,7 +536,6 @@ def buildAllPeriodicCenters3D(centers, rveSize, radius):
         if xt > rveW - radius: all_centers.append((xt - rveW, yt))
         if yt < radius: all_centers.append((xt, yt + rveH))
         if yt > rveH - radius: all_centers.append((xt, yt - rveH))
-        # 角落检查
         if xt < radius and yt < radius and math.sqrt(xt ** 2 + yt ** 2) < radius:
             all_centers.append((xt + rveW, yt + rveH))
         if xt < radius and yt > rveH - radius and math.sqrt(xt ** 2 + (rveH - yt) ** 2) < radius:
@@ -709,8 +597,8 @@ def classifyCellsImproved(all_cells, rveSize, rveVolume,
     print("    Cells to classify: %d" % len(potential_cells))
 
     # 步骤2: 构建完整的周期性纤维中心列表
-    all_fiber_centers_for_classify = buildAllPeriodicCenters3D(fiber_centers, rveSize, fiberRadius)
-    print("    Total fiber centers (with periodicity): %d" % len(all_fiber_centers_for_classify))
+    all_fiber_centers = buildAllPeriodicCenters3D(fiber_centers, rveSize, fiberRadius)
+    print("    Total fiber centers (with periodicity): %d" % len(all_fiber_centers))
 
     # 步骤3: 详细分类
     print("\n  Step 3: Detailed classification using geometry")
@@ -720,7 +608,6 @@ def classifyCellsImproved(all_cells, rveSize, rveVolume,
     for idx, cell in enumerate(potential_cells):
         cell_center = None
         try:
-            # 优先使用 pointOn, 它保证在几何体内
             if hasattr(cell, 'pointOn') and cell.pointOn:
                 point = cell.pointOn[0]
                 cell_center = (point[0], point[1], point[2])
@@ -728,7 +615,6 @@ def classifyCellsImproved(all_cells, rveSize, rveVolume,
             pass
         if cell_center is None:
             try:
-                # 其次尝试 getCentroid
                 cell_centroid = cell.getCentroid()
                 if cell_centroid and len(cell_centroid) >= 3:
                     cell_center = (cell_centroid[0], cell_centroid[1], cell_centroid[2])
@@ -736,7 +622,6 @@ def classifyCellsImproved(all_cells, rveSize, rveVolume,
                 pass
         if cell_center is None:
             try:
-                # 最后尝试用顶点均值
                 cell_center = getCellCenterFromVertices(cell)
             except:
                 pass
@@ -749,14 +634,13 @@ def classifyCellsImproved(all_cells, rveSize, rveVolume,
 
         # 计算到最近纤维中心的XY距离
         min_dist_fib = float('inf')
-        for fc_x, fc_y in all_fiber_centers_for_classify:
+        for fc_x, fc_y in all_fiber_centers:
             dist = math.sqrt((cell_x - fc_x) ** 2 + (cell_y - fc_y) ** 2)
             if dist < min_dist_fib:
                 min_dist_fib = dist
 
         # 判断归属 (孔隙是Cut掉的, 不会在这里被找到)
-        # 引入1e-9的公差防止浮点数误差
-        if min_dist_fib < (fiberRadius - 1e-9):
+        if min_dist_fib < fiberRadius:
             fiber_cells_list.append(cell)
         else:
             matrix_cells_list.append(cell)
@@ -782,9 +666,9 @@ def classifyCellsImproved(all_cells, rveSize, rveVolume,
     print("    Target Vf (from input): %.4f" % target_Vf_fib_count)
     print("    Actual Vf (from cells): %.4f" % actual_Vf_fib)
 
-    if len(fiber_cells_list) != len(all_fiber_centers_for_classify):
+    if len(fiber_cells_list) != len(all_fiber_centers):
         print("\n  WARNING: Classified fiber cell count (%d) does not match"
-              " periodic fiber count (%d)." % (len(fiber_cells_list), len(all_fiber_centers_for_classify)))
+              " periodic fiber count (%d)." % (len(fiber_cells_list), len(all_fiber_centers)))
         print("  This may be due to boolean operation failures or classification errors.")
 
     print("=" * 70 + "\n")
@@ -809,7 +693,7 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
                               # 空隙相关参数
                               enable_void=True,
                               void_porosity=0.02,
-                              void_cylinder_dims=[0.01, 0.005],
+                              void_sphere_radius=0.01,
                               min_void_dist_factor=2.0,
                               fiber_void_min_dist_factor=1.05,
                               void_boundary_threshold_factor=1.0,
@@ -848,11 +732,12 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
                               job_name='Job-1',
                               num_cpus=8,
                               abaqus_plugin_path='d:/Abaqus2023/Plugins'):
-    """创建带多空隙(圆柱体)缺陷的三维RVE模型主函数"""
+    """创建带多空隙缺陷的三维RVE模型主函数"""
 
     print("\n" + "=" * 70)
-    print("Starting 3D RVE Model Generation (WITH MULTI-CYLINDER-VOID DEFECTS)")
-    print("Algorithm: Fibers First (F-F), Voids Second (V-V 3D-Axis & F-V 2D-Conservative-Center).")
+    print("Starting 3D RVE Model Generation (WITH MULTI-VOID DEFECTS)")
+    print("Algorithm: Fibers First (F-F), Voids Second (V-V 3D-Center & F-V 2D-Center).")
+    print("PBC: ABAQUS Micromechanics Plugin.")
     print("=" * 70)
 
     # ==================== 步骤 1: 计算几何参数 (纤维) ====================
@@ -906,38 +791,33 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
     void_info = None
 
     # --- 空隙参数 ---
-    # 根据 圆柱体 参数 [Length, Radius]
-    void_length = void_cylinder_dims[0]
-    void_radius = void_cylinder_dims[1]
-    void_dims = [void_length, void_radius]  # 存储 [Length, Radius] 格式用于导出
+    # 根据 球体 参数 [Radius]
+    void_radius = void_sphere_radius
 
-    # --- F-V 间距 (2D 保守) ---
-    # 采用空隙的包围球半径作为2D检测的保守半径
-    void_bounding_radius = math.sqrt((void_length / 2.0) ** 2 + void_radius ** 2)
-    # 纤维-空隙 最小间距 (基于2D中心, 采用保守的包围球半径)
-    minFiberVoidDistance_2D_conservative = fiber_void_min_dist_factor * (fiberRadius + void_bounding_radius)
+    # --- F-V 间距 (2D 中心-中心) ---
+    minFiberVoidDistance_2D_FV = fiber_void_min_dist_factor * (fiberRadius + void_radius)
 
-    # --- V-V 间距 (3D 轴-轴) ---
-    # 空隙-空隙 最小轴-轴间距 (基于直径)
-    minVoidDistance_axis = min_void_dist_factor * (void_radius * 2.0)
+    # --- V-V 间距 (3D 中心-中心) ---
+    minVoidDistance_3D_VV = min_void_dist_factor * (void_radius)
 
-    # 边界检查 (使用真实包围球半径)
-    void_r_max_overall = void_bounding_radius
+    # 边界检查 (使用半径)
+    void_r_max_overall = void_radius
 
     num_voids_target = 0
     if enable_void and void_porosity > 0:
         target_total_void_volume = void_porosity * rveVolume
-        vol_per_void = math.pi * (void_radius ** 2) * void_length
+        # 体积是 4/3 * pi * R^3
+        vol_per_void = (4.0 / 3.0) * math.pi * (void_radius ** 3)
         if vol_per_void == 0:
-            raise ValueError("Void radius or length cannot be zero.")
+            raise ValueError("Void radius cannot be zero.")
         num_voids_target = int(round(target_total_void_volume / vol_per_void))
 
         print("  Target Void Porosity: %.4f%%" % (void_porosity * 100))
-        print("  Void Dimensions (Length, Radius): %.6f, %.6f" % (void_length, void_radius))
+        print("  Void Radius: %.6f" % (void_radius))
         print("  Calculated Number of Voids: %d" % num_voids_target)
         print(
-            "  Min Fiber-Void Center-to-Center Distance (2D Conservative): %.6f" % minFiberVoidDistance_2D_conservative)
-        print("  Min Void-Void Axis-to-Axis Distance (3D): %.6f" % minVoidDistance_axis)
+            "  Min Fiber-Void Center-to-Center Distance (2D): %.6f" % minFiberVoidDistance_2D_FV)
+        print("  Min Void-Void Center-to-Center Distance (3D): %.6f" % minVoidDistance_3D_VV)
     else:
         print("  Void generation SKIPPED (enable_void=False or porosity=0)")
         enable_void = False
@@ -947,9 +827,10 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
         print("\nStep 4: Generating void coordinates (V-V & F-V constraints)...")
 
         void_list = _generate_void_coordinates_rsa(
-            num_voids_target, rveSize, void_length,
-            minVoidDistance_axis,
-            fiber_centers, minFiberVoidDistance_2D_conservative
+            num_voids_target, rveSize,
+            minVoidDistance_3D_VV,
+            fiber_centers,
+            minFiberVoidDistance_2D_FV
         )
 
         if not void_list:
@@ -960,7 +841,7 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
                 void_csv_filename = "VoidGeometry_3D_Por%d_%s.csv" % (
                     int(void_porosity * 10000), time.strftime("%Y%m%d_%H%M%S"))
                 void_info = exportVoidGeometryToCSV(void_csv_filename, void_list,
-                                                    void_dims, rveVolume, void_porosity)
+                                                    void_radius, rveVolume, void_porosity)
         print("Step 4 Complete.")
     else:
         print("\nStep 4: Void generation skipped.")
@@ -1048,86 +929,82 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
         print("  Step 8b: Creating void instances (with 3D periodicity) for cutting...")
 
         # 验证空隙尺寸是否合理
-        min_void_size = min(void_length, void_radius)
+        min_void_size = void_radius
         if min_void_size < 0.0005:  # 小于0.5微米
             print("    WARNING: Void dimensions are very small (min: %.6f mm)" % min_void_size)
             print("    This may cause geometry creation issues in Abaqus.")
             print("    Recommendation: Use void dimensions >= 0.001 mm")
 
-        # 1. 创建一个模板空隙Part, 然后多次实例化
-        # 这样可以避免创建成百上千个临时Part
-        temp_part_name = 'VoidPart-Template'
-        p_void_cylinder = model.Part(name=temp_part_name, dimensionality=THREE_D, type=DEFORMABLE_BODY)
-
-        # 2. 创建圆柱体几何 (草图 + 拉伸)
-        # 我们将其创建为: 沿Z轴, 长度L, 半径R
-        sketch_size = max(4.0 * void_radius, 0.02)
-        s_circle = model.ConstrainedSketch(name='__circle_profile_template__',
-                                           sheetSize=sketch_size)
-        s_circle.CircleByCenterPerimeter(center=(0.0, 0.0), point1=(void_radius, 0.0))
-
-        try:
-            p_void_cylinder.BaseSolidExtrude(sketch=s_circle, depth=void_length)
-            del model.sketches['__circle_profile_template__']
-        except Exception as e:
-            print("      ERROR: Failed to create void template part. Boolean Cut will be skipped.")
-            print("      Error: %s" % str(e))
-            # 如果模板都创建失败, 则禁用空隙
-            enable_void = False
-            cutting_instances = []
-            del model.parts[temp_part_name]  # 清理失败的Part
-        else:
-            cutting_instances = []
-            inst_counter = 0
+        cutting_instances = []
+        temp_void_part_names = []  # 存储名称以供以后清理
+        inst_counter = 0
 
         # 空隙的最大尺寸，用于边界判断
         void_threshold = void_r_max_overall * void_boundary_threshold_factor
 
-        # 仅在模板创建成功时才继续
-        if enable_void:
-            for i, void_data in enumerate(void_list):
-                cx, cy, cz, rot_z, rot_x = void_data
-                center = (cx, cy, cz)
+        for i, void_data in enumerate(void_list):
+            cx, cy, cz, _, _ = void_data
+            center = (cx, cy, cz)
 
-                # (智能策略) 判断该空隙需要在哪些镜像位置创建副本
-                mirror_offsets = determineMirrorOffsets_3D(center, rveSize, void_threshold)
+            # (智能策略) 判断该空隙需要在哪些镜像位置创建副本
+            mirror_offsets = determineMirrorOffsets_3D(center, rveSize, void_threshold)
 
-                # 创建原始空隙实例 (中心RVE内) 和所有必要的镜像实例
-                positions_to_create = [(0, 0, 0)]
-                positions_to_create.extend(mirror_offsets)
+            # 创建原始空隙实例 (中心RVE内) 和所有必要的镜像实例
+            positions_to_create = [(0, 0, 0)]
+            positions_to_create.extend(mirror_offsets)
 
-                for offset in positions_to_create:
-                    inst_counter += 1
-                    inst_name = 'Void-Inst-%d' % inst_counter
+            for offset in positions_to_create:
+                inst_counter += 1
+                inst_name = 'Void-Inst-%d' % inst_counter
 
-                    # 3. 创建实例 (来自共享的 p_void_cylinder Part)
-                    inst_void = assembly.Instance(name=inst_name, part=p_void_cylinder, dependent=OFF)
+                # 1. 为每个空隙创建独立的球体Part
+                temp_part_name = 'VoidPart-%d' % inst_counter
+                temp_void_part_names.append(temp_part_name)
+                p_void_sphere = model.Part(name=temp_part_name, dimensionality=THREE_D, type=DEFORMABLE_BODY)
 
-                    # 4. 将实例变换到初始状态 (轴线沿Y轴)
-                    # (1) 平移使其中心在原点 (拉伸后在 z=0 到 z=L)
-                    assembly.translate(instanceList=(inst_name,), vector=(0.0, 0.0, -void_length / 2.0))
-                    # (2) 旋转90度, 使其轴线沿Y轴
-                    assembly.rotate(instanceList=(inst_name,),
-                                    axisPoint=(0.0, 0.0, 0.0), axisDirection=(1.0, 0.0, 0.0),
-                                    angle=90.0)
+                # 2. 创建球体几何 (通过旋转半圆)
+                sketch_size = max(4.0 * void_radius, 0.02)
+                s_sphere = model.ConstrainedSketch(name='__sphere_profile_%d__' % inst_counter,
+                                                   sheetSize=sketch_size)
 
-                    # 5. 旋转（Z-X欧拉角）
-                    if abs(rot_z) > 1e-6:
-                        assembly.rotate(instanceList=(inst_name,),
-                                        axisPoint=(0.0, 0.0, 0.0), axisDirection=(0.0, 0.0, 1.0),
-                                        angle=math.degrees(rot_z))
-                    if abs(rot_x) > 1e-6:
-                        assembly.rotate(instanceList=(inst_name,),
-                                        axisPoint=(0.0, 0.0, 0.0), axisDirection=(1.0, 0.0, 0.0),
-                                        angle=math.degrees(rot_x))
+                # 绘制旋转轴 (Y轴)
+                s_sphere.ConstructionLine(point1=(0.0, -2.0 * void_radius), point2=(0.0, 2.0 * void_radius))
+                s_sphere.assignCenterline(line=s_sphere.geometry.findAt((0.0, 0.0)))
 
-                    # 6. 平移到最终位置（原始中心 + 周期性偏移）
-                    final_pos = (cx + offset[0], cy + offset[1], cz + offset[2])
-                    assembly.translate(instanceList=(inst_name,), vector=final_pos)
+                # 绘制半圆弧 (右侧)
+                s_sphere.ArcByCenterEnds(center=(0.0, 0.0),
+                                         point1=(0.0, void_radius),
+                                         point2=(0.0, -void_radius),
+                                         direction=CLOCKWISE)
+                # 封闭直线
+                s_sphere.Line(point1=(0.0, void_radius), point2=(0.0, -void_radius))
 
-                    cutting_instances.append(inst_void)
+                try:
+                    p_void_sphere.BaseSolidRevolve(sketch=s_sphere, angle=360.0, flipRevolveDirection=OFF)
+                    del model.sketches['__sphere_profile_%d__' % inst_counter]
+                except Exception as e:
+                    print("      ERROR: Failed to create void sphere #%d. Error: %s" % (inst_counter, str(e)))
+                    try:
+                        del model.sketches['__sphere_profile_%d__' % inst_counter]
+                    except:
+                        pass
+                    try:
+                        del model.parts[temp_part_name]
+                    except:
+                        pass
+                    continue
 
-            print("    Created %d total void instances (including 3D mirrors)." % len(cutting_instances))
+                # 3. 创建实例
+                inst_void = assembly.Instance(name=inst_name, part=p_void_sphere, dependent=OFF)
+
+                # 4. 平移到最终位置（原始中心 + 周期性偏移）
+                # (球体是旋转不变的, 不需要旋转步骤)
+                final_pos = (cx + offset[0], cy + offset[1], cz + offset[2])
+                assembly.translate(instanceList=(inst_name,), vector=final_pos)
+
+                cutting_instances.append(inst_void)
+
+        print("    Created %d total void instances (including 3D mirrors)." % len(cutting_instances))
 
         if cutting_instances:
             assembly.InstanceFromBooleanCut(
@@ -1336,9 +1213,9 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
                    minSizeFactor=minSizeFactor, constraint=FREE)
 
     # 定义体单元类型
-    elemType_bulk_tet = ElemType(elemCode=C3D4, elemLibrary=STANDARD,
+    elemType_bulk_tet = ElemType(elemCode=C3D10, elemLibrary=STANDARD,
                                  elemDeletion=ON, maxDegradation=0.99)
-    elemType_bulk_wedge = ElemType(elemCode=C3D6, elemLibrary=STANDARD,
+    elemType_bulk_wedge = ElemType(elemCode=C3D15, elemLibrary=STANDARD,
                                    elemDeletion=ON, maxDegradation=0.99)
     elemType_bulk_hex = ElemType(elemCode=C3D8R, elemLibrary=STANDARD,
                                  elemDeletion=ON, maxDegradation=0.99)
@@ -1454,7 +1331,7 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
             sys.path.insert(0, abaqus_plugin_path)
         import microMechanics
         from microMechanics.mmpBackend import Interface
-        from microMechanics.mmpBackend.mmpInterface.mmpRVEConstants import LOADUSERDEFINED
+        from microMechanics.mmpBackend.mmpInterface.mmpRVEConstants import *
     except ImportError as e:
         print("\n  FATAL ERROR: Failed to import Micromechanics Plugin.")
         print("  Please ensure the plugin is installed and the path is correct:")
@@ -1525,10 +1402,11 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
     print("\nStep 15: Cleaning up temporary parts...")
     parts_to_delete = [p for p in ['Fiber', 'Matrix', 'RVE-Temp-WithFibers'] if p in model.parts]
 
-    # 将临时的空隙模板Part添加到删除列表中
-    if enable_void and 'temp_part_name' in locals():
-        if temp_part_name in model.parts:
-            parts_to_delete.append(temp_part_name)
+    # 将临时的空部件添加到删除列表中
+    if enable_void and 'temp_void_part_names' in locals():
+        for part_name in temp_void_part_names:
+            if part_name in model.parts:
+                parts_to_delete.append(part_name)
 
     for part_name in parts_to_delete:
         try:
@@ -1562,45 +1440,45 @@ if __name__ == '__main__':
 
     # ========== 全局配置参数 ==========
     # RVE尺寸[宽度X, 高度Y, 深度Z](单位:mm)
-    RVE_SIZE = [0.057, 0.057, 0.035]
+    RVE_SIZE = [0.057, 0.057, 0.01]
     # 纤维半径(单位:mm)
     FIBER_RADIUS = 0.0035
     # 目标纤维体积分数(0-1)
-    TARGET_VF = 0.6
+    TARGET_VF = 0.5
     # RSA播种比例 (0.0 ~ 1.0)，高值(如0.9)排布更均匀，低值(如0.1)更接近物理堆积, 速度较慢
-    RSA_SEEDING_RATIO = 0.95
+    RSA_SEEDING_RATIO = 0.9
 
     # ========== 间距参数 ==========
     # 纤维-纤维 最小中心距因子 (min_dist = 因子 * fiberRadius)
     FIBER_MIN_DIST_FACTOR = 2.05
 
-    # 纤维-空隙 最小间距因子 (min_dist = 因子 * (fiberRadius + void_bounding_radius))
-    # 这是一个2D保守检测 (void_bounding_radius = sqrt((L/2)^2 + R^2))
+    # 纤维-空隙 最小间距因子 (min_dist = 因子 * (fiberRadius + void_radius))
+    # 这是一个2D投影的中心-中心距离
     FIBER_VOID_MIN_DIST_FACTOR = 1.05
 
-    # 空隙-空隙 最小轴-轴间距因子 (min_dist = 因子 * void_diameter)
-    # 这是一个3D轴线-轴线距离
-    MIN_VOID_DIST_FACTOR = 1.5
+    # 空隙-空隙 最小中心距因子 (min_dist = 因子 * void_radius)
+    # 这是一个3D中心-中心距离
+    MIN_VOID_DIST_FACTOR = 2.1
 
     # ========== 空隙缺陷参数 ==========
     ENABLE_VOID = True  # 是否启用空隙缺陷
     # 目标空隙率(0-1)
     VOID_POROSITY = 0.01
 
-    # 单个圆柱体空隙的尺寸 [长度, 半径] (单位:mm)
+    # 单个球体空隙的半径 (单位:mm)
     # 脚本将自动计算所需数量以达到 VOID_POROSITY
-    VOID_CYLINDER_DIMS = [0.002, 0.001]
+    VOID_SPHERE_RADIUS = 0.0015
 
-    # 空隙3D周期性边界阈值因子 (threshold = 因子 * void_bounding_radius)
+    # 空隙3D周期性边界阈值因子 (threshold = 因子 * Radius)
     VOID_BOUNDARY_THRESHOLD_FACTOR = 1.0
 
     EXPORT_VOID_GEOMETRY = True  # 是否导出空隙几何信息到CSV
 
     # ========== 网格参数 ==========
     GLOBAL_SEED_SIZE = 0.0008  # 全局网格尺寸(单位:mm)
-    DEVIATION_FACTOR = 0.1  # 网格偏离因子: 允许网格偏离真实几何的程度
+    DEVIATION_FACTOR = 0.5  # 网格偏离因子: 允许网格偏离真实几何的程度
     # 最小网格尺寸因子: (最小单元 / 全局尺寸)。 必须足够小以捕捉到最薄的基体/空隙间隙。
-    MIN_SIZE_FACTOR = 0.1
+    MIN_SIZE_FACTOR = 0.5
 
     # ========== 纤维材料参数 (GPa) ==========
     FIBER_E1 = 230.0  # 纤维轴向模量(单位:GPa)
@@ -1628,7 +1506,7 @@ if __name__ == '__main__':
     COHESIVE_K_TT = 1e8  # 界面第二切向刚度(单位:N/mm³)
     COHESIVE_T_N = 44.0  # 界面法向强度(单位:MPa)
     COHESIVE_T_S = 82.0  # 界面第一切向强度(单位:MPa)
-    COHESIVE_T_T = 82.0  # 界面第二切向强度(单位:MPa)
+    COHESIVE_T_T = 82.0  # 界面第一切向强度(单位:MPa)
     COHESIVE_GIC = 0.001  # I型断裂能(单位:N/mm)
     COHESIVE_GIIC = 0.002  # II型断裂能(单位:N/mm)
     COHESIVE_GIIIC = 0.002  # III型断裂能(单位:N/mm)
@@ -1653,7 +1531,7 @@ if __name__ == '__main__':
     ABAQUS_PLUGIN_PATH = 'd:/Abaqus2023/Plugins'
 
     print("\n" + "=" * 70)
-    print("Starting 3D RVE Generation (Fiber First / V-V/F-V Axis Check / MP-PBC Version)...")
+    print("Starting 3D RVE Generation (Multi-Void / MP-PBC Version)...")
     print("=" * 70)
     print("Target Model Name: %s" % targetModelName)
     print("Target Job Name: %s" % JOB_NAME)
@@ -1680,7 +1558,7 @@ if __name__ == '__main__':
         # 空隙参数
         enable_void=ENABLE_VOID,
         void_porosity=VOID_POROSITY,
-        void_cylinder_dims=VOID_CYLINDER_DIMS,
+        void_sphere_radius=VOID_SPHERE_RADIUS,
         min_void_dist_factor=MIN_VOID_DIST_FACTOR,
         fiber_void_min_dist_factor=FIBER_VOID_MIN_DIST_FACTOR,
         void_boundary_threshold_factor=VOID_BOUNDARY_THRESHOLD_FACTOR,
