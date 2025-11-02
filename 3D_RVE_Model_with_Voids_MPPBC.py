@@ -1378,7 +1378,8 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
         Interface.Loading.MechanicalModelMaker(
             modelName=modelName,
             jobName=job_name,
-            constraintType='PERIODIC',
+            # constraintType='PERIODIC',
+            constraintType='TAYLOR',
             drivenField='STRAIN',
             mechanicalHistoryType=LOADUSERDEFINED,  # 对应 "User-Defined"
             fieldHistory1=field_history_tuple,  # 对应 E12=0.02, Amp=Default
@@ -1633,3 +1634,4 @@ if __name__ == '__main__':
         print("\n" + "!" * 70)
         print("ERROR: Model generation failed. Temporary model not found.")
         print("!" * 70 + "\n")
+
