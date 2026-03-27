@@ -585,7 +585,7 @@ def applyPeriodicConstraints3D(model, instanceName, node_pairs, pair_type, const
     for i, (node1, node2) in enumerate(node_pairs):  # node1 是从节点(slave), node2 是主节点(master)
 
         # --- 检查从节点是否已经被之前的约束处理过 ---
-        if node1.label in constrained_nodes_set:
+        if node1.label in constrained_nodes_set or node2.label in constrained_nodes_set:
             # 如果从节点的标签已经在集合中，说明它的自由度已被约束，跳过此节点对，避免重复约束
             continue  # 跳到下一个节点对
 
@@ -611,6 +611,7 @@ def applyPeriodicConstraints3D(model, instanceName, node_pairs, pair_type, const
 
         # --- 将处理过的从节点标签添加到集合中 ---
         constrained_nodes_set.add(node1.label)
+        constrained_nodes_set.add(node2.label)
         nodes_constrained_in_this_call += 1  # 增加计数
 
     # 打印本次调用实际约束了多少个新的从节点
@@ -1309,7 +1310,6 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
 
     # ==================== 步骤 11: 材料和截面 ====================
     print("\nStep 11: Defining materials and sections...")
-
     # 基体材料 (Drucker-Prager)
     mat_matrix = model.Material(name='Matrix-Material')
     mat_matrix.Elastic(table=((matrix_E, matrix_nu),))
@@ -1332,8 +1332,8 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
     mat_cohesive.QuadsDamageInitiation(table=((cohesive_t_n, cohesive_t_s, cohesive_t_t),))
     mat_cohesive.quadsDamageInitiation.DamageEvolution(type=ENERGY, mixedModeBehavior=BK, power=cohesive_eta,
                                                        table=((cohesive_GIC, cohesive_GIIC, cohesive_GIIIC),))
-    # 粘性稳定系数
-    mat_cohesive.quadsDamageInitiation.DamageStabilizationCohesive(cohesiveCoeff=cohesive_stab_coeff)
+    # # 粘性稳定系数
+    # mat_cohesive.quadsDamageInitiation.DamageStabilizationCohesive(cohesiveCoeff=cohesive_stab_coeff)
 
     # 截面定义
     model.HomogeneousSolidSection(name='FiberSection', material='Fiber-Material')
@@ -1364,48 +1364,91 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
 
     print("Step 11 Complete.")
 
-    # ==================== 步骤 12: 网格 ====================
-    print("\nStep 12: Meshing RVE...")
+    # ==================== 步骤 12: 网格 (采用健壮的混合策略) ====================
+    print("\nStep 12: Meshing RVE (Robust Hybrid Strategy)...")
     p_rve = model.parts['RVE-3D']
     p_rve.seedPart(size=globalSeedSize, deviationFactor=deviationFactor,
                    minSizeFactor=minSizeFactor, constraint=FREE)
 
-    # 定义体单元类型
-    elemType_bulk_tet = ElemType(elemCode=C3D4, elemLibrary=STANDARD,
-                                 elemDeletion=ON, maxDegradation=0.99)
-    elemType_bulk_wedge = ElemType(elemCode=C3D6, elemLibrary=STANDARD,
-                                   elemDeletion=ON, maxDegradation=0.99)
+    # --- 1. 定义线性单元类型 ---
+    # --- 策略1 (SWEEP) 使用的线性单元 (C3D8R / C3D6) ---
+    # 用于扫掠(SWEEP)网格: 线性六面体(C3D8R)
     elemType_bulk_hex = ElemType(elemCode=C3D8R, elemLibrary=STANDARD,
                                  elemDeletion=ON, maxDegradation=0.99)
 
-    # 将体单元类型仅赋予基体和纤维
+    # 用于扫掠(SWEEP)网格: 线性楔形(C3D6)
+    elemType_bulk_wedge_linear = ElemType(elemCode=C3D6, elemLibrary=STANDARD,
+                                          elemDeletion=ON, maxDegradation=0.99)
+
+    # --- 策略2 (FREE) 使用的二次单元 (C3D10 / C3D15) ---
+    # 用于自由(FREE)网格: 二次四面体(C3D10)
+    elemType_bulk_tet_quadratic = ElemType(elemCode=C3D10, elemLibrary=STANDARD,
+                                           elemDeletion=ON, maxDegradation=0.99)
+
+    # 用于自由(FREE)网格: 二次楔形(C3D15)
+    elemType_bulk_wedge_quadratic = ElemType(elemCode=C3D15, elemLibrary=STANDARD,
+                                             elemDeletion=ON, maxDegradation=0.99)
+    # # 线性四面体(C3D4) (可选用，目前先用二次，保留线性需求)
+    # elemType_bulk_tet_linear = ElemType(elemCode=C3D4, elemLibrary=STANDARD,
+    #                                     elemDeletion=ON, maxDegradation=0.99)
+
+    # 获取需要划分网格的体单元 (基体和纤维)
     bulk_cells_list = []
     if 'set_MatrixCell' in p_rve.sets:
         bulk_cells_list.extend(p_rve.sets['set_MatrixCell'].cells)
     if 'set_FiberCells' in p_rve.sets:
         bulk_cells_list.extend(p_rve.sets['set_FiberCells'].cells)
 
+    meshing_technique = 'NONE'
+
     if bulk_cells_list:
-        if enable_void:
-            print("  Using TET-dominated mesh (suitable for void-containing geometry)...")
-            p_rve.setMeshControls(regions=CellArray(bulk_cells_list),
-                                  elemShape=TET, technique=FREE)
-            # 必须同时允许TET和WEDGE，因为TET网格划分器会生成WEDGE作为过渡
-            p_rve.setElementType(regions=(CellArray(bulk_cells_list),),
-                                 elemTypes=(elemType_bulk_tet, elemType_bulk_wedge))
-        else:
-            print("  Using HEX-dominated mesh with SWEEP technique...")
-            p_rve.setMeshControls(regions=CellArray(bulk_cells_list),
+        bulk_cell_array = CellArray(bulk_cells_list)
+        try:
+            # --- 策略 1: 尝试扫掠(SWEEP)网格 (优先) ---
+            print("  Strategy 1/2: Attempting HEX-dominated SWEEP mesh...")
+            p_rve.setMeshControls(regions=bulk_cell_array,
                                   elemShape=HEX_DOMINATED, technique=SWEEP)
-            # 允许六面体和楔形
-            p_rve.setElementType(regions=(CellArray(bulk_cells_list),),
-                                 elemTypes=(elemType_bulk_hex, elemType_bulk_wedge))
+
+            # 指派线性六面体(C3D8R)和线性楔形(C3D6)
+            p_rve.setElementType(regions=(bulk_cell_array,),
+                                 elemTypes=(elemType_bulk_hex, elemType_bulk_wedge_linear))
+
+            print("  Generating mesh (SWEEP)...")
+            p_rve.generateMesh()
+
+            print("  SUCCESS: SWEEP meshing completed.")
+            meshing_technique = 'SWEEP_HEX'
+
+        except Exception as e:
+            # --- 策略 2: 扫掠失败, 降级为自由(FREE)网格 ---
+            print("\n  WARNING: SWEEP meshing failed. %s" % str(e))
+            print("  Strategy 2/2: Falling back to QUADRATIC TET FREE mesh (C3D10)...")
+
+            # 必须先清除失败的网格控制
+            try:
+                p_rve.deleteMeshControls(regions=bulk_cell_array)
+                print("  Cleared failed SWEEP controls.")
+            except:
+                print("  Could not clear old mesh controls, proceeding anyway.")
+
+            p_rve.setMeshControls(regions=bulk_cell_array,
+                                  elemShape=TET, technique=FREE)
+
+            # 指派二次四面体(C3D10)和二次楔形(C3D15)
+            p_rve.setElementType(regions=(bulk_cell_array,),
+                                 elemTypes=(elemType_bulk_tet_quadratic, elemType_bulk_wedge_quadratic))
+
+            print("  Generating mesh (FREE_TET_QUADRATIC)...")
+            p_rve.generateMesh()
+
+            print("  SUCCESS: FREE QUADRATIC TET meshing completed.")
+            meshing_technique = 'FREE_TET'
     else:
         print("  WARNING: No bulk cells (Matrix/Fiber) found to assign element type.")
 
-    print("  Generating mesh for all regions...")
-    p_rve.generateMesh()
-    print("  Total elements (pre-insertion): %d" % len(p_rve.elements))
+    print("\n  Mesh Generation Summary:")
+    print("    Total elements (pre-insertion): %d" % len(p_rve.elements))
+    print("    Final meshing technique used: %s" % meshing_technique)
     print("Step 12 Complete.")
 
     # ==================== 步骤 13: 粘接单元处理 ====================
@@ -1453,9 +1496,9 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
     if len(p_rve.sets['set_CohesiveElements'].elements) > 0:
         # 定义 Cohesive 单元类型 (8节点 和 6节点)
         elemType_coh_hex = ElemType(elemCode=COH3D8, elemLibrary=STANDARD,
-                                    elemDeletion=ON, maxDegradation=0.99)
+                                    elemDeletion=ON, maxDegradation=0.99, viscosity=0.0001)
         elemType_coh_wedge = ElemType(elemCode=COH3D6, elemLibrary=STANDARD,
-                                      elemDeletion=ON, maxDegradation=0.99)
+                                      elemDeletion=ON, maxDegradation=0.99, viscosity=0.0001)
 
         # 同时分配 COH3D8 和 COH3D6 ***
         # 因为TET网格(C3D4)的面是三角形, 生成COH3D6
@@ -1567,7 +1610,6 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
     if unpaired_nodes_total > 0:
         print("\n  NOTE: %d boundary nodes could not be paired." % unpaired_nodes_total)
 
-
 # =================================================================
 #                 主执行入口
 # =================================================================
@@ -1576,11 +1618,11 @@ if __name__ == '__main__':
 
     # ========== 全局配置参数 ==========
     # RVE尺寸[宽度X, 高度Y, 深度Z](单位:mm)
-    RVE_SIZE = [0.057, 0.057, 0.01]
+    RVE_SIZE = [0.057, 0.057, 0.0035]
     # 纤维半径(单位:mm)
     FIBER_RADIUS = 0.0035
     # 目标纤维体积分数(0-1)
-    TARGET_VF = 0.3
+    TARGET_VF = 0.6
     # RSA播种比例 (0.0 ~ 1.0)，高值(如0.9)排布更均匀，低值(如0.1)更接近物理堆积, 速度较慢
     RSA_SEEDING_RATIO = 0.9
 
@@ -1594,10 +1636,10 @@ if __name__ == '__main__':
 
     # 空隙-空隙 最小中心距因子 (min_dist = 因子 * void_radius)
     # 这是一个3D中心-中心距离
-    MIN_VOID_DIST_FACTOR = 2.1
+    MIN_VOID_DIST_FACTOR = 2.05
 
     # ========== 空隙缺陷参数 ==========
-    ENABLE_VOID = True  # 是否启用空隙缺陷
+    ENABLE_VOID = False  # 是否启用空隙缺陷
     # 目标空隙率(0-1)
     VOID_POROSITY = 0.01
 
@@ -1608,7 +1650,7 @@ if __name__ == '__main__':
     # 空隙3D周期性边界阈值因子 (threshold = 因子 * Radius)
     VOID_BOUNDARY_THRESHOLD_FACTOR = 1.0
 
-    EXPORT_VOID_GEOMETRY = True  # 是否导出空隙几何信息到CSV
+    EXPORT_VOID_GEOMETRY = False  # 是否导出空隙几何信息到CSV
 
     # ========== 网格参数 ==========
     GLOBAL_SEED_SIZE = 0.001  # 全局网格尺寸(单位:mm)
@@ -1715,7 +1757,6 @@ if __name__ == '__main__':
         cohesive_GIC=COHESIVE_GIC, cohesive_GIIC=COHESIVE_GIIC, cohesive_GIIIC=COHESIVE_GIIIC,
         cohesive_eta=COHESIVE_ETA, cohesive_stab_coeff=COHESIVE_STAB_COEFF
     )
-
     # ========== 后处理 ==========
     if tempModelName in mdb.models:
         print("\n" + "=" * 70)
