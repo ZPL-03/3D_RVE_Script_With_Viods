@@ -696,7 +696,7 @@ def applyPeriodicConstraints3D(model, instanceName, node_pairs, pair_type, const
     for i, (node1, node2) in enumerate(node_pairs):  # node1 是从节点(slave), node2 是主节点(master)
 
         # --- 检查从节点是否已经被之前的约束处理过 ---
-        if node1.label in constrained_nodes_set:
+        if node1.label in constrained_nodes_set or node2.label in constrained_nodes_set:
             # 如果从节点的标签已经在集合中，说明它的自由度已被约束，跳过此节点对，避免重复约束
             continue  # 跳到下一个节点对
 
@@ -722,6 +722,7 @@ def applyPeriodicConstraints3D(model, instanceName, node_pairs, pair_type, const
 
         # --- 将处理过的从节点标签添加到集合中 ---
         constrained_nodes_set.add(node1.label)
+        constrained_nodes_set.add(node2.label)
         nodes_constrained_in_this_call += 1  # 增加计数
 
     # 打印本次调用实际约束了多少个新的从节点
@@ -1577,9 +1578,9 @@ def create3DRVEModelWithVoids(modelName='RVE_3D_with_Voids',
     if len(p_rve.sets['set_CohesiveElements'].elements) > 0:
         # 定义 Cohesive 单元类型 (8节点 和 6节点)
         elemType_coh_hex = ElemType(elemCode=COH3D8, elemLibrary=STANDARD,
-                                    elemDeletion=ON, maxDegradation=0.99)
+                                    elemDeletion=ON, maxDegradation=0.99, viscosity=0.0001)
         elemType_coh_wedge = ElemType(elemCode=COH3D6, elemLibrary=STANDARD,
-                                      elemDeletion=ON, maxDegradation=0.99)
+                                      elemDeletion=ON, maxDegradation=0.99, viscosity=0.0001)
 
         # 同时分配 COH3D8 和 COH3D6 ***
         # 因为TET网格(C3D4)的面是三角形, 生成COH3D6
@@ -1703,7 +1704,7 @@ if __name__ == '__main__':
     # 纤维半径(单位:mm)
     FIBER_RADIUS = 0.0035
     # 目标纤维体积分数(0-1)
-    TARGET_VF = 0.3
+    TARGET_VF = 0.4
     # RSA播种比例 (0.0 ~ 1.0)，高值(如0.9)排布更均匀，低值(如0.1)更接近物理堆积, 速度较慢
     RSA_SEEDING_RATIO = 0.9
 
@@ -1717,7 +1718,7 @@ if __name__ == '__main__':
 
     # 空隙-空隙 最小轴-轴间距因子 (min_dist = 因子 * void_diameter)
     # 这是一个3D轴线-轴线距离
-    MIN_VOID_DIST_FACTOR = 1.5
+    MIN_VOID_DIST_FACTOR = 1.65
 
     # ========== 空隙缺陷参数 ==========
     ENABLE_VOID = True  # 是否启用空隙缺陷
